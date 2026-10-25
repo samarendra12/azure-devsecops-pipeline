@@ -1,0 +1,5 @@
+# Example Terraform variable values
+azure_subscription_id = "00000000-0000-0000-0000-000000000000"
+resource_group_name   = "rg-axion-infrastructure-prod"
+azure_region          = "East US"
+environment           = "production"

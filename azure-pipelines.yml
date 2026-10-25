@@ -1,0 +1,188 @@
+# Multi-Stage DevSecOps Pipeline on Azure DevOps
+# Enforces Shift-Left Quality & Security Gates before Infrastructure Provisioning
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - '*.tf'
+      - azure-pipelines.yml
+
+pool:
+  vmImage: 'ubuntu-latest' # Compatible with both ubuntu-latest and self-hosted pools (e.g. axionpool)
+
+variables:
+  azureServiceConnection: 'testing-axion-service-connection'
+  tfStateResourceGroup: 'rg-terraform-state-prod'
+  tfStateStorageAccount: 'axionstg1234'
+  tfStateContainer: 'axion-tfstate'
+  tfStateKey: 'axion.terraform.tfstate'
+
+stages:
+  # ----------------------------------------------------
+  # STAGE 1: Secret Detection (Gitleaks)
+  # ----------------------------------------------------
+  - stage: GitleaksScan
+    displayName: 'Secret Scanning (Gitleaks)'
+    jobs:
+      - job: GitleaksJob
+        displayName: 'Scan Commit History for Secrets'
+        steps:
+          - script: |
+              echo "==> Running Gitleaks secret detection..."
+              if command -v gitleaks &> /dev/null; then
+                gitleaks detect --source . -v
+              else
+                echo "Gitleaks CLI not pre-installed on runner. Installing..."
+                curl -sSfL https://raw.githubusercontent.com/gitleaks/gitleaks/master/scripts/install.sh | sh -s -- -b /tmp
+                /tmp/gitleaks detect --source . -v
+              fi
+            displayName: 'Execute Gitleaks'
+
+  # ----------------------------------------------------
+  # STAGE 2: Static Analysis & Linting (TFLint)
+  # ----------------------------------------------------
+  - stage: TFLintScan
+    displayName: 'Terraform Linting (TFLint)'
+    dependsOn: GitleaksScan
+    jobs:
+      - job: TFLintJob
+        displayName: 'Run TFLint Static Rules'
+        steps:
+          - script: |
+              echo "==> Initializing TFLint..."
+              if ! command -v tflint &> /dev/null; then
+                curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+              fi
+              tflint --init
+              tflint --version
+              tflint
+            displayName: 'Execute TFLint'
+
+  # ----------------------------------------------------
+  # STAGE 3: Security & Misconfiguration (TFSec)
+  # ----------------------------------------------------
+  - stage: TFSecScan
+    displayName: 'Security Scanning (TFSec / Trivy)'
+    dependsOn: TFLintScan
+    jobs:
+      - job: TFSecJob
+        displayName: 'Scan IaC for Misconfigurations'
+        steps:
+          - script: |
+              echo "==> Running TFSec / Trivy config scan..."
+              if ! command -v tfsec &> /dev/null; then
+                curl -sSfL https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+              fi
+              tfsec . --concise-output --soft-fail=false
+            displayName: 'Execute TFSec'
+
+  # ----------------------------------------------------
+  # STAGE 4: Cloud Cost Estimation (Infracost)
+  # ----------------------------------------------------
+  - stage: InfracostScan
+    displayName: 'Cost Estimation (Infracost)'
+    dependsOn: TFSecScan
+    jobs:
+      - job: InfracostJob
+        displayName: 'Generate Infrastructure Cost Differential'
+        steps:
+          - script: |
+              echo "==> Running Infracost breakdown..."
+              if command -v infracost &> /dev/null; then
+                infracost breakdown --path .
+              else
+                echo "Infracost CLI step configured (Set INFRACOST_API_KEY secret in pipeline variables)."
+              fi
+            displayName: 'Execute Infracost'
+
+  # ----------------------------------------------------
+  # STAGE 5: Terraform Init, Validate & Plan
+  # ----------------------------------------------------
+  - stage: TerraformPlan
+    displayName: 'Terraform Init, Validate & Plan'
+    dependsOn: InfracostScan
+    jobs:
+      - job: TerraformPlanJob
+        displayName: 'Generate Execution Plan'
+        steps:
+          - task: TerraformInstaller@1
+            displayName: 'Install Terraform 1.7.x'
+            inputs:
+              terraformVersion: 'latest'
+
+          - task: TerraformTask@5
+            displayName: 'Terraform Init'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              backendServiceArm: '$(azureServiceConnection)'
+              backendAzureRmResourceGroupName: '$(tfStateResourceGroup)'
+              backendAzureRmStorageAccountName: '$(tfStateStorageAccount)'
+              backendAzureRmContainerName: '$(tfStateContainer)'
+              backendAzureRmKey: '$(tfStateKey)'
+
+          - task: TerraformTask@5
+            displayName: 'Terraform Validate'
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+
+          - task: TerraformTask@5
+            displayName: 'Terraform Plan'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              environmentServiceNameAzureRM: '$(azureServiceConnection)'
+              commandOptions: '-out=$(Build.ArtifactStagingDirectory)/tfplan'
+
+          - publish: $(Build.ArtifactStagingDirectory)/tfplan
+            artifact: tfplan
+            displayName: 'Publish Execution Plan Artifact'
+
+  # ----------------------------------------------------
+  # STAGE 6: Terraform Apply (Gated by Approval)
+  # ----------------------------------------------------
+  - stage: TerraformApply
+    displayName: 'Terraform Apply (Production)'
+    dependsOn: TerraformPlan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: ApplyDeploymentJob
+        displayName: 'Apply Terraform Changes'
+        environment: 'Azure-Production' # Environment in ADO enforcing approvals
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform 1.7.x'
+                  inputs:
+                    terraformVersion: 'latest'
+
+                - task: TerraformTask@5
+                  displayName: 'Terraform Init'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'init'
+                    backendServiceArm: '$(azureServiceConnection)'
+                    backendAzureRmResourceGroupName: '$(tfStateResourceGroup)'
+                    backendAzureRmStorageAccountName: '$(tfStateStorageAccount)'
+                    backendAzureRmContainerName: '$(tfStateContainer)'
+                    backendAzureRmKey: '$(tfStateKey)'
+
+                - download: current
+                  artifact: tfplan
+                  displayName: 'Download Plan Artifact'
+
+                - task: TerraformTask@5
+                  displayName: 'Terraform Apply'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    environmentServiceNameAzureRM: '$(azureServiceConnection)'
+                    commandOptions: '$(Pipeline.Workspace)/tfplan/tfplan'
